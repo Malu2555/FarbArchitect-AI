@@ -19,6 +19,14 @@ from __future__ import annotations
 
 import modal
 
+# Deployment revision marker: 2026-11-02-cors-hotfix.
+# Bumped to force Modal to create a fresh function version so the updated
+# `llm-keys` secret (with CORS_ALLOWED_ORIGINS pointing at the Vercel origin)
+# is read at container cold-start. Modal's deploy fingerprint hashes the app
+# definition (code + secret *names*) but not secret *contents*, so a secret
+# value change alone otherwise resolves to "Deployment skipped: no changes
+# detected!" and leaves the previous warm container holding the stale env.
+
 # ---------------------------------------------------------------------------
 # Image: minimal Debian + our exact requirements + the backend sources
 # ---------------------------------------------------------------------------
