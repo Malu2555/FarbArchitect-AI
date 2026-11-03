@@ -7,12 +7,13 @@ import base64
 import numpy as np
 import pytest
 
-from agents.schemas import EquipmentItem
+from agents.schemas import EquipmentItem, Hazard, SimulationResult
 from agents.spatial_renderer import (
     build_fallback_result,
     render_spatial,
     sanitize_layout,
     validate_layout,
+    _derive_hazards,
 )
 from core.png import PNG_SIGNATURE, png_data_url, png_encode_rgb
 from core.providers import ProviderError
@@ -283,5 +284,221 @@ async def test_render_spatial_empty_layout() -> None:
     assert result.spatial_spec.footprints == []
     assert result.spatial_spec.canvas.no_overlap is True
     assert result.spatial_spec.canvas.no_clipping is True
+
+
+
+# ---------------------------------------------------------------------------
+# Per-machine hazard derivation (drives the canvas edge stripes)
+# ---------------------------------------------------------------------------
+def _sim(
+    *,
+    peak_c: float = 20.0,
+    peak_at: tuple[int, int] = (10, 10),
+    hazards: list[Hazard] | None = None,
+) -> SimulationResult:
+    return SimulationResult(
+        peak_c=peak_c,
+        peak_at=peak_at,
+        temp_min=18.0,
+        temp_max=peak_c,
+        temp_grid_rle="",
+        hazards=hazards or [],
+    )
+
+
+def _vib(a_id: str, b_id: str, a_c: tuple[int, int], b_c: tuple[int, int]) -> Hazard:
+    return Hazard(
+        type="vibration",
+        a_id=a_id,
+        b_id=b_id,
+        a_center=a_c,
+        b_center=b_c,
+        threshold=6.0,
+        measured=4.5,
+        severity="high",
+    )
+
+
+def _thermal(a_id: str, a_c: tuple[int, int], measured: float = 31.49) -> Hazard:
+    return Hazard(
+        type="thermal",
+        a_id=a_id,
+        a_center=a_c,
+        threshold=26.0,
+        measured=measured,
+        severity="high" if measured > 32.0 else "medium",
+    )
+
+
+def test_derive_hazards_marks_both_sides_of_vibration_pair() -> None:
+    a = _item("A", x=10, y=10)
+    b = _item("B", x=12, y=10)
+    sim = _sim(hazards=[_vib("A", "B", (12, 12), (14, 12))])
+
+    marks = _derive_hazards([a, b], sim)
+
+    assert "vibration" in marks.get("A", [])
+    assert "vibration" in marks.get("B", [])
+
+
+def test_derive_hazards_marks_every_thermal_violator() -> None:
+    """The solver emits one thermal hazard per violating machine; all get marked."""
+    hot_a = _item("HOT_A", x=10, y=10)
+    hot_b = _item("HOT_B", x=40, y=40)
+    cool = _item("COOL", x=80, y=80)
+    sim = _sim(
+        peak_c=31.49,
+        peak_at=(12, 12),
+        hazards=[_thermal("HOT_A", (12, 12)), _thermal("HOT_B", (42, 42), 28.0)],
+    )
+
+    marks = _derive_hazards([hot_a, hot_b, cool], sim)
+
+    assert marks["HOT_A"] == ["thermal"]
+    assert marks["HOT_B"] == ["thermal"]
+    assert "COOL" not in marks
+
+
+def test_derive_hazards_thermal_safety_net_when_no_per_machine_hazard() -> None:
+    """No thermal hazards recorded but global peak > limit -> nearest gets marked."""
+    close = _item("CLOSE", x=28, y=28)  # center (30, 30)
+    far = _item("FAR", x=80, y=80)
+    sim = _sim(peak_c=31.49, peak_at=(30, 30), hazards=[])
+
+    marks = _derive_hazards([close, far], sim)
+
+    assert marks == {"CLOSE": ["thermal"]}
+
+
+def test_derive_hazards_no_thermal_mark_when_peak_is_compliant() -> None:
+    item = _item("A", x=30, y=30)
+    sim = _sim(peak_c=24.0, peak_at=(30, 30), hazards=[])
+
+    assert _derive_hazards([item], sim) == {}
+
+
+def test_derive_hazards_ignores_hazards_for_unknown_machines() -> None:
+    item = _item("A", x=10, y=10)
+    sim = _sim(
+        peak_c=31.49,
+        peak_at=(12, 12),
+        hazards=[_thermal("GHOST", (12, 12))],
+    )
+
+    # "GHOST" is not in the layout -> dropped. The safety net then fires for A
+    # because no *known* machine carries a thermal hazard.
+    marks = _derive_hazards([item], sim)
+    assert "GHOST" not in marks
+    assert marks.get("A") == ["thermal"]
+
+
+def test_derive_hazards_unions_across_multiple_sims() -> None:
+    """A machine whose vibration was resolved still keeps its tag via the union."""
+    a = _item("A", x=10, y=10)
+    b = _item("B", x=12, y=10)
+    baseline = _sim(peak_c=31.49, peak_at=(12, 12), hazards=[_vib("A", "B", (12, 12), (14, 12))])
+    # Corrected layout: vibration gone, but the machines are still thermal.
+    best = _sim(peak_c=30.0, peak_at=(12, 12), hazards=[_thermal("A", (12, 12))])
+
+    marks = _derive_hazards([a, b], [baseline, best])
+
+    assert "vibration" in marks["A"]
+    assert "thermal" in marks["A"]
+    assert "vibration" in marks["B"]
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_preserves_vibration_tag_from_baseline() -> None:
+    """End-to-end: vibration that best_sim no longer reports still gets a stripe."""
+    a = _item("A", x=10, y=10)
+    b = _item("B", x=12, y=10)
+    baseline = _sim(peak_c=31.49, peak_at=(12, 12), hazards=[_vib("A", "B", (12, 12), (14, 12))])
+    best = _sim(peak_c=20.0, peak_at=(12, 12), hazards=[])
+
+    result = await render_spatial([a, b], sim=[baseline, best])
+
+    by_id = {box.id: box for box in result.spatial_spec.footprints}
+    assert "vibration" in by_id["A"].hazards
+    assert "vibration" in by_id["B"].hazards
+
+
+def test_derive_hazards_can_stack_thermal_and_vibration_on_one_machine() -> None:
+    a = _item("A", x=28, y=28)  # center (30, 30)
+    b = _item("B", x=33, y=28)
+    sim = _sim(
+        peak_c=31.49,
+        peak_at=(30, 30),
+        hazards=[
+            _vib("A", "B", (30, 30), (35, 30)),
+            _thermal("A", (30, 30)),
+        ],
+    )
+
+    marks = _derive_hazards([a, b], sim)
+
+    assert marks["A"] == ["vibration", "thermal"]
+    assert marks["B"] == ["vibration"]
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_propagates_sim_hazards_to_footprints() -> None:
+    # No providers -> deterministic fallback path, but hazards still applied.
+    a = _item("A", x=28, y=28)
+    b = _item("B", x=33, y=28)
+    sim = _sim(
+        peak_c=31.49,
+        peak_at=(30, 30),
+        hazards=[
+            _vib("A", "B", (30, 30), (35, 30)),
+            _thermal("A", (30, 30)),
+        ],
+    )
+
+    result = await render_spatial([a, b], sim=sim)
+
+    by_id = {box.id: box for box in result.spatial_spec.footprints}
+    assert by_id["A"].hazards == ["vibration", "thermal"]
+    assert by_id["B"].hazards == ["vibration"]
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_marks_every_thermal_violator() -> None:
+    """All machines the solver flagged as thermal get a stripe, not just the peak."""
+    first = _item("FIRST", x=10, y=10)
+    second = _item("SECOND", x=60, y=60)
+    third = _item("THIRD", x=80, y=20)
+    sim = _sim(
+        peak_c=31.49,
+        peak_at=(12, 12),
+        hazards=[
+            _thermal("FIRST", (12, 12)),
+            _thermal("SECOND", (62, 62), 28.0),
+        ],
+    )
+
+    result = await render_spatial([first, second, third], sim=sim)
+
+    by_id = {box.id: box for box in result.spatial_spec.footprints}
+    assert by_id["FIRST"].hazards == ["thermal"]
+    assert by_id["SECOND"].hazards == ["thermal"]
+    assert by_id["THIRD"].hazards == []
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_without_sim_leaves_hazards_empty() -> None:
+    items = [_item("A", x=10, y=10)]
+
+    result = await render_spatial(items)
+
+    assert result.spatial_spec.footprints[0].hazards == []
+
+
+def test_build_fallback_result_carries_hazards_when_sim_given() -> None:
+    a = _item("A", x=28, y=28)
+    sim = _sim(peak_c=40.0, peak_at=(30, 30))
+
+    result = build_fallback_result([a], sim)
+
+    assert result.spatial_spec.footprints[0].hazards == ["thermal"]
 
 

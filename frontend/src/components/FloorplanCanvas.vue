@@ -64,7 +64,27 @@ function decodeRLE(rle, expectedSize) {
 
 const afterGrid = computed(() => decodeRLE(props.after?.temp_grid_rle, GRID * GRID));
 const activeGrid = computed(() => afterGrid.value);
-const hazards = computed(() => props.after?.hazards || props.before?.hazards || []);
+// Hazard *zones* drawn on the canvas. We union `before` and `after` so the
+// thermal/vibration overlays tell the whole story: what the solver found in the
+// incoming scene AND what (if anything) survived the correction. A bare
+// `after.hazards || before.hazards` would be wrong twice over — an empty array
+// is truthy in JS, and the corrector usually resolves vibration, so `after`
+// alone would hide the conflicts the agent detected and fixed.
+// Dedupe by (type, a_id, b_id) so a hazard present in both states draws once.
+const hazards = computed(() => {
+  const seen = new Set();
+  const merged = [];
+  for (const list of [props.after?.hazards, props.before?.hazards]) {
+    if (!Array.isArray(list)) continue;
+    for (const h of list) {
+      const key = `${h?.type}:${h?.a_id}:${h?.b_id ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(h);
+    }
+  }
+  return merged;
+});
 const peakC = computed(() => props.after?.peak_c ?? props.before?.peak_c ?? 20);
 
 /**
@@ -102,6 +122,9 @@ const footprints = computed(() => {
         w: f.size[0],
         h: f.size[1],
         label: f.label || f.id,
+        // Carry the per-box hazard tags through to the canvas layer. These
+        // drive the orange/violet edge stripes (drawHazardStripes).
+        hazards: Array.isArray(f.hazards) ? f.hazards : [],
       }));
   }
   const source =
@@ -159,9 +182,11 @@ function drawVibration(context, items) {
     for (const [cx, cy] of centers) {
       context.beginPath();
       context.arc(cx, cy, radius, 0, Math.PI * 2);
-      context.fillStyle = 'rgba(239, 68, 68, 0.16)';
+      // Violet (139, 92, 246) matches the per-box vibration stripe below and
+      // the legend swatch, so "vibration" reads the same color everywhere.
+      context.fillStyle = 'rgba(139, 92, 246, 0.16)';
       context.fill();
-      context.strokeStyle = 'rgba(248, 113, 113, 0.85)';
+      context.strokeStyle = 'rgba(167, 139, 250, 0.85)';
       context.lineWidth = 1.5;
       context.stroke();
     }
@@ -186,10 +211,31 @@ function drawFootprints(context, items) {
     context.strokeRect(x + 1, y + 1, w - 2, h - 2);
     context.setLineDash([]);
 
+    // Per-machine hazard stripes: orange-left for thermal, violet-right for
+    // vibration. Kept in sync with the backend PNG renderer (core/png.py) so
+    // the canvas thumbnail tells the same story.
+    drawHazardStripes(context, item, x, y, w, h);
+
     context.fillStyle = '#5eead4';
     const label = String(item.label || item.id || '');
     const text = label.length > 20 ? `${label.slice(0, 19)}…` : label;
     context.fillText(text, x + 4, y + 4);
+  }
+}
+
+function drawHazardStripes(context, item, x, y, w, h) {
+  const hazards = Array.isArray(item.hazards) ? item.hazards : [];
+  if (!hazards.length) return;
+  const stripe = hazards.length > 1 ? 3 : 4;
+  const top = y + 1;
+  const height = h - 2;
+  if (hazards.includes('thermal')) {
+    context.fillStyle = 'rgba(249, 115, 22, 0.95)';
+    context.fillRect(x + 1, top, stripe, height);
+  }
+  if (hazards.includes('vibration')) {
+    context.fillStyle = 'rgba(139, 92, 246, 0.95)';
+    context.fillRect(x + w - 1 - stripe, top, stripe, height);
   }
 }
 
@@ -208,8 +254,8 @@ function drawLegend(context) {
   context.stroke();
 
   const rows = [
-    { color: 'rgba(249, 115, 22, 0.85)', label: 'Thermal > 22 C' },
-    { color: 'rgba(239, 68, 68, 0.75)', label: 'Vibration zone' },
+    { color: 'rgba(249, 115, 22, 0.85)', label: 'Thermal (left stripe)' },
+    { color: 'rgba(139, 92, 246, 0.85)', label: 'Vibration (right stripe)' },
     { color: '#14b8a6', label: 'Optimized footprint' },
   ];
 

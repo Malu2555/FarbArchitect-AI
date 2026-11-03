@@ -47,6 +47,18 @@ _TOKENS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "danger": ((60, 13, 13), (239, 68, 68), (254, 202, 202)),
 }
 
+#: Hazard edge-stripe colours. Thermal matches the frontend heat-grid orange;
+#: vibration is violet so the two are immediately distinguishable even at a
+#: 500x500 pixel scale. A box that carries both hazards gets both stripes.
+_HAZARD_STRIPES: dict[str, tuple[int, int, int]] = {
+    "thermal": (249, 115, 22),  # orange-500
+    "vibration": (139, 92, 246),  # violet-500
+}
+#: Stripe width as a fraction of the footprint width, clamped to [1, MAX] px.
+_STRIPE_FRACTION = 0.12
+_STRIPE_MIN_PX = 2
+_STRIPE_MAX_PX = 6
+
 LABEL_SCALE = 2  # 10x14 px per glyph on a 500x500 canvas
 LABEL_PAD = 3  # px inset from the footprint's top-left corner
 OUTSIDE_PAD = 4  # px gap when a label is annotated beside its footprint
@@ -92,6 +104,48 @@ def png_data_url(image: np.ndarray) -> str:
     """Return a ``data:image/png;base64,...`` URL for the given RGB array."""
     encoded = base64.b64encode(png_encode_rgb(image)).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def _draw_hazard_stripes(
+    img: np.ndarray,
+    hazards: list[str],
+    *,
+    X0: int,
+    Y0: int,
+    X1: int,
+    Y1: int,
+) -> None:
+    """Overlay vertical edge stripes for each hazard the box participates in.
+
+    * ``thermal``   -> stripe on the **left** edge of the footprint (orange)
+    * ``vibration`` -> stripe on the **right** edge of the footprint (violet)
+
+    Both may be present; in that case each stripe is half as wide so both fit
+    inside the box without overlapping the fill or the labels.
+    """
+    if not hazards:
+        return
+
+    width = max(1, X1 - X0)
+    stripe = int(min(_STRIPE_MAX_PX, max(_STRIPE_MIN_PX, width * _STRIPE_FRACTION)))
+    if len(hazards) > 1:
+        # Two hazards -> shrink each stripe to half width so both fit.
+        stripe = max(1, stripe // 2)
+
+    slots = list(hazards)  # preserve caller order: thermal, vibration
+    for kind in slots:
+        colour = _HAZARD_STRIPES.get(kind)
+        if colour is None:
+            continue  # unknown hazard kind: skip silently
+        if kind == "vibration":
+            sx0 = max(X0, X1 - stripe + 1)
+            sx1 = X1
+        else:  # "thermal" and any future non-vibration hazard -> left edge
+            sx0 = X0
+            sx1 = min(X1, X0 + stripe - 1)
+        if sx1 <= sx0:
+            continue  # box too thin to draw the stripe
+        img[Y0 : Y1 + 1, sx0 : sx1 + 1] = colour
 
 
 def rasterize_cleanroom(
@@ -154,6 +208,19 @@ def rasterize_cleanroom(
                 Y1=Y1,
                 canvas=size,
                 color=label_color,
+            )
+
+        # Per-box hazard stripes: orange-left for thermal, violet-right for
+        # vibration. Drawn last so they remain visible over the fill/label.
+        hazards = box.get("hazards") or []
+        if isinstance(hazards, (list, tuple)) and hazards:
+            _draw_hazard_stripes(
+                img,
+                [str(h) for h in hazards],
+                X0=X0,
+                Y0=Y0,
+                X1=X1,
+                Y1=Y1,
             )
 
     return img

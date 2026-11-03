@@ -348,9 +348,10 @@ async def run_correction(
     best_sim: SimulationResult | None = None
     best_equipment: list[EquipmentItem] = list(working)
     best_score: float | None = None
-    baseline_peak = simulate_scene(
+    baseline_sim = simulate_scene(
         Scene(seed=scene.seed, grid_size=scene.grid_size, equipment=list(scene.equipment))
-    ).peak_c
+    )
+    baseline_peak = baseline_sim.peak_c
 
     prev_score: float | None = None
 
@@ -496,11 +497,22 @@ async def run_correction(
     if use_spatial_stage:
         try:
             providers = [image_provider] if image_provider is not None else build_image_providers()
-            spatial_result = await render_spatial(best_equipment, providers=providers)
+            # Union hazards from BOTH the incoming baseline and the corrected
+            # best layout. Vibration is usually resolved by the time we render,
+            # so drawing from `best_sim` alone would hide the conflicts the
+            # agent detected and fixed - exactly the indicator story the canvas
+            # is meant to tell.
+            spatial_result = await render_spatial(
+                best_equipment,
+                sim=[baseline_sim, best_sim],
+                providers=providers,
+            )
             spatial_source = spatial_result.spatial_spec.canvas.source
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("spatial_stage_failed: %s", exc)
-            spatial_result = build_fallback_result(best_equipment)
+            spatial_result = build_fallback_result(
+                best_equipment, [baseline_sim, best_sim]
+            )
             spatial_source = "FALLBACK"
 
     return CorrectionOutcome(

@@ -32,8 +32,12 @@ const tone = computed(() => {
   if (!props.count) return 'border-slate-700 bg-slate-900/80 text-slate-400';
   if (props.loading) return 'border-sky-500/40 bg-sky-500/10 text-sky-200';
   if (!codes.value.length) return 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200';
-  if (codes.value.includes('E_TEMP_PEAK'))
-    return 'border-rose-500/50 bg-rose-500/10 text-rose-200';
+  const hasThermal = codes.value.includes('E_TEMP_PEAK');
+  const hasVibration = codes.value.includes('E_VIBRATION_CONFLICT');
+  if (hasThermal && hasVibration)
+    return 'border-fuchsia-500/50 bg-fuchsia-500/10 text-fuchsia-200';
+  if (hasThermal) return 'border-rose-500/50 bg-rose-500/10 text-rose-200';
+  if (hasVibration) return 'border-violet-500/50 bg-violet-500/10 text-violet-200';
   return 'border-amber-500/50 bg-amber-500/10 text-amber-200';
 });
 

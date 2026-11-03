@@ -92,6 +92,11 @@ class FootprintBox(BaseModel):
     label: str
     z_index: int = 0
     color_token: Literal["teal", "warn", "danger"] = "teal"
+    #: Hazard classes this machine participates in. Additive and ordered; a box
+    #: can be both a thermal hotspot and a vibration participant. Drives the
+    #: edge-stripe overlay in ``core/png.py`` and the frontend canvas. Defaults
+    #: to empty so legacy callers / LLM replies that omit the field still parse.
+    hazards: list[Literal["thermal", "vibration"]] = []
 
 
 class CanvasProvenance(BaseModel):

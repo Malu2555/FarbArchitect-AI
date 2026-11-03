@@ -190,11 +190,14 @@ chars), and `peak_c` (the simulation after that turn).
 ### Spatial output
 
 `spatial.spatial_spec.footprints` is the canvas-ready geometry (boxes, labels,
-color token). `spatial.preview_png_data_url` is a server-rendered PNG of the
-floor — pixels are produced by an in-house string-art decoder (`core/png.py`,
-`core/font5x7.py`), **not** a generative model. When the optional Meta image
-endpoint is configured the thumbnail shows `source: MUSE_IMAGE`, otherwise
-`source: FALLBACK`.
+color token, per-box `hazards`). `spatial.preview_png_data_url` is a
+server-rendered PNG of the floor — pixels are produced by an in-house string-art
+decoder (`core/png.py`, `core/font5x7.py`), **not** a generative model. Each box
+gets an orange stripe on its left edge when it is a thermal hotspot and a violet
+stripe on its right edge when it participates in a vibration pair (see
+[Hazard indicators](#hazard-indicators-thermal-vs-vibration) below). When the
+optional Meta image endpoint is configured the thumbnail shows
+`source: MUSE_IMAGE`, otherwise `source: FALLBACK`.
 
 ---
 
@@ -553,6 +556,56 @@ The local renderer draws machine names using a bundled **5×7 bitmap font**
 Footprint fill/edge/label colors follow `color_token`
 (`teal` / `warn` / `danger`), so a hazard flagged by Muse Image visibly changes
 the box color in the preview.
+
+### Hazard indicators: thermal vs vibration
+
+`spatial.spatial_spec.footprints[*].hazards` is a per-machine list
+(`"thermal"` / `"vibration"`) derived by the Python solver — **never** invented
+by the model. Two channels use it so the two hazard classes are visually
+distinct everywhere:
+
+| Hazard | Colour | Where it appears |
+|---|---|---|
+| **Thermal** (peak > 26 °C) | **Orange** `#f97316` | Orange heat-grid cells **+ a 2px stripe on the box's *left* edge** |
+| **Vibration** (two ≥70 dB machines in critical proximity) | **Violet** `#8b5cf6` | Violet halo ring around each participant **+ a 2px stripe on the box's *right* edge** |
+
+A machine that is *both* a thermal hotspot and a vibration participant carries
+**both stripes** (orange left, violet right) — the two indicators stack rather
+than compete. The mapping is byte-identical in the backend PNG
+(`core/png.py::_draw_hazard_stripes`) and the frontend canvas
+(`FloorplanCanvas.vue::drawHazardStripes`), so the thumbnail and the live canvas
+never disagree.
+
+Derivation rules (`spatial_renderer.py::_derive_hazards`):
+
+- **Source of truth** — the solver (`core/heat_solver.py`, `core/vibration.py`)
+  decides *which* machines are in trouble; the renderer never re-guesses
+  geometry.
+- **Vibration** — *both* sides of every `type=="vibration"` hazard get the token
+  (the pair is marked symmetrically).
+- **Thermal** — every machine that produced a `type=="thermal"` hazard (its
+  footprint centre exceeded 26 °C). The solver emits one per violating machine,
+  so all of them are striped, not just the single hottest one. A safety net
+  covers the edge case where the global peak exceeds the limit *between* two
+  machines: if no per-machine thermal hazard was emitted, the machine nearest
+  `peak_at` is marked instead.
+- **Union across the run** — the corrector passes `[baseline_sim, best_sim]`, so
+  the tags are unioned per machine id. This is deliberate: the corrector usually
+  *resolves* vibration, so drawing from `best_sim` alone would hide exactly the
+  conflicts the agent detected and fixed. The stripes tell the explainability
+  story — "this machine had a thermal / vibration problem during the run" — even
+  once it has been moved clear.
+
+The `ConstraintBadge` follows the same palette for the summary code:
+`E_TEMP_PEAK` → rose, `E_VIBRATION_CONFLICT` → violet, both → fuchsia.
+
+> **Why a demo run may show no violet stripes:** vibration is rare in the
+> synthetic generator (24 of 300 seeds) and, when present, the corrector usually
+> resolves it. Use a seed such as **63, 74, 78, or 84** to see the vibration
+> stripes; seed 42 has no vibration conflict at all. In the scenario editor, drop
+> two high-dB machines (e.g. two CMP Polishers, 96 dB) close together. The
+> frontend hazard overlay unions `before` and `after`, so a *resolved* conflict
+> still paints its violet halo.
 
 The frontend paints `spatial.spatial_spec.footprints` (teal dashed boxes) over
 the thermal/vibration overlays, and renders `preview_png_data_url` as a
