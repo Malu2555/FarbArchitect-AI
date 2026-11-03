@@ -27,12 +27,15 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AllProvidersFailed",
+    "FireworksImageProvider",
     "FireworksProvider",
     "MetaImageProvider",
     "MetaProvider",
     "ModelRouter",
     "ProviderError",
+    "build_fireworks_image_provider",
     "build_image_provider",
+    "build_image_providers",
 ]
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=8.0, read=25.0, write=25.0, pool=5.0)
@@ -217,14 +220,19 @@ class MetaProvider(_BaseProvider):
 
 class FireworksProvider(_BaseProvider):
     name = "fireworks"
-    #: Llama 3.3 70B (chat-instruct) needs no reasoning headroom; 1024 tokens
-    #: comfortably covers the JSON correction object. Raise via
-    #: ``FIREWORKS_MAX_TOKENS`` if you point this at a reasoning model.
-    DEFAULT_MAX_TOKENS = 1024
+    #: The current default model is ``muse-spark-open`` - a Meta-family
+    #: **reasoning** model (verified live via ``/inference/v1/models``). It
+    #: needs headroom for its internal thinking (~640 reasoning tokens at
+    #: ``reasoning_effort=low``), so the default cap is 4096 rather than the
+    #: chat-instruct 1024. If you point ``FIREWORKS_MODEL_ID`` at a
+    #: non-reasoning chat model, set ``FIREWORKS_MAX_TOKENS=1024`` and leave
+    #: ``FIREWORKS_REASONING_EFFORT`` empty (chat-instruct models reject the
+    #: field).
+    DEFAULT_MAX_TOKENS = 4096
 
     def __init__(self) -> None:
-        # Strategy agent only. 45 s covers a 70B chat-instruct round-trip with
-        # slack; reasoning models can need more (raise FIREWORKS_READ_TIMEOUT_S).
+        # Strategy agent only. 45 s covers the reasoning round-trip with slack;
+        # raise ``FIREWORKS_READ_TIMEOUT_S`` for slower models.
         read_s = float(os.environ.get("FIREWORKS_READ_TIMEOUT_S", "45"))
         super().__init__(
             base_url=os.environ.get(
@@ -233,7 +241,7 @@ class FireworksProvider(_BaseProvider):
             api_key=os.environ.get("FIREWORKS_API_KEY", ""),
             model_id=os.environ.get(
                 "FIREWORKS_MODEL_ID",
-                "accounts/fireworks/models/minimax-m3",
+                "accounts/fireworks/models/muse-spark-open",
             ),
             timeout=httpx.Timeout(
                 connect=8.0, read=read_s, write=read_s, pool=5.0
@@ -243,10 +251,12 @@ class FireworksProvider(_BaseProvider):
         self.max_tokens = int(
             os.environ.get("FIREWORKS_MAX_TOKENS", str(self.DEFAULT_MAX_TOKENS))
         )
-        # Optional escape hatch for reasoning models (muse-spark-open). Empty
-        # for chat-instruct models like Llama 3.3 70B, which reject the field.
+        # Reasoning effort: defaults to ``low`` because the default model is a
+        # reasoning model. Set ``FIREWORKS_REASONING_EFFORT=`` (explicitly
+        # empty) to omit the field entirely, which some chat-instruct models
+        # require.
         self.reasoning_effort = (
-            os.environ.get("FIREWORKS_REASONING_EFFORT", "") or ""
+            os.environ.get("FIREWORKS_REASONING_EFFORT", "low") or ""
         ).strip()
 
     def _body_overrides(self) -> dict[str, Any]:
@@ -317,6 +327,91 @@ class MetaImageProvider(_BaseProvider):
         )
 
 
+class FireworksImageProvider(_BaseProvider):
+    """Stage-2 spatial renderer fallback - the Fireworks mirror of Muse Image.
+
+    Counterpart to :class:`MetaImageProvider`: same signature, same expected
+    JSON shape (``{"footprints": [...], "notes": [...]}``), but pointed at the
+    Fireworks inference endpoint so the spatial stage survives a Meta API
+    outage instead of dropping straight to the deterministic rasteriser.
+
+    Uses its own env-var namespace so the spatial model can differ from the
+    strategy model if you want:
+
+    * ``FIREWORKS_IMAGE_MODEL_ID`` (default ``accounts/fireworks/models/muse-spark-open``)
+    * ``FIREWORKS_IMAGE_BASE_URL`` (defaults to ``FIREWORKS_BASE_URL``)
+    * ``FIREWORKS_IMAGE_TIMEOUT_S`` (defaults to ``FIREWORKS_READ_TIMEOUT_S`` / 45s)
+    * ``FIREWORKS_IMAGE_MAX_TOKENS`` (defaults to ``FIREWORKS_MAX_TOKENS`` / 4096)
+    * ``FIREWORKS_IMAGE_REASONING_EFFORT`` (defaults to ``FIREWORKS_REASONING_EFFORT`` / ``low``)
+    """
+
+    name = "fireworks_image"
+    #: mirror of :class:`FireworksProvider` - reasoning models need headroom.
+    DEFAULT_MAX_TOKENS = 4096
+
+    def __init__(self) -> None:
+        image_timeout = float(
+            os.environ.get("FIREWORKS_IMAGE_TIMEOUT_S")
+            or os.environ.get("FIREWORKS_READ_TIMEOUT_S", "45")
+        )
+        super().__init__(
+            base_url=os.environ.get("FIREWORKS_IMAGE_BASE_URL")
+            or os.environ.get(
+                "FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"
+            ),
+            api_key=os.environ.get("FIREWORKS_API_KEY", ""),
+            model_id=os.environ.get("FIREWORKS_IMAGE_MODEL_ID")
+            or os.environ.get(
+                "FIREWORKS_MODEL_ID",
+                "accounts/fireworks/models/muse-spark-open",
+            ),
+            timeout=httpx.Timeout(
+                connect=8.0, read=image_timeout, write=image_timeout, pool=5.0
+            ),
+        )
+        self.max_tokens = int(
+            os.environ.get("FIREWORKS_IMAGE_MAX_TOKENS")
+            or os.environ.get(
+                "FIREWORKS_MAX_TOKENS", str(self.DEFAULT_MAX_TOKENS)
+            )
+        )
+        self.reasoning_effort = (
+            os.environ.get("FIREWORKS_IMAGE_REASONING_EFFORT")
+            or os.environ.get("FIREWORKS_REASONING_EFFORT", "low")
+        ).strip()
+
+    def _body_overrides(self) -> dict[str, Any]:
+        if not self.reasoning_effort:
+            return {}
+        return {"reasoning_effort": self.reasoning_effort}
+
+    async def complete(  # type: ignore[override]
+        self,
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        *,
+        max_tokens: int = 0,  # 0 = "use self.max_tokens" (the env cap)
+        temperature: float = 0.2,
+    ) -> dict[str, Any]:
+        if not self.api_key:
+            raise ProviderError(self.name, "E_NO_KEY", "FIREWORKS_API_KEY missing")
+        if not self.model_id:
+            raise ProviderError(
+                self.name,
+                "E_NO_MODEL",
+                "FIREWORKS_IMAGE_MODEL_ID not configured",
+            )
+        effective = max_tokens if max_tokens > 0 else self.max_tokens
+        if self.max_tokens > 0:
+            effective = min(effective, self.max_tokens)
+        return await super().complete(
+            messages,
+            schema,
+            max_tokens=effective,
+            temperature=temperature,
+        )
+
+
 def build_image_provider() -> MetaImageProvider | None:
     """Instantiate the Muse Image provider **only** when it is configured.
 
@@ -328,6 +423,39 @@ def build_image_provider() -> MetaImageProvider | None:
     if not os.environ.get("META_LLAMA_KEY"):
         return None
     return MetaImageProvider()
+
+
+def build_fireworks_image_provider() -> FireworksImageProvider | None:
+    """Instantiate the Fireworks spatial fallback only when it is configured.
+
+    Requires both ``FIREWORKS_API_KEY`` and a model id (either
+    ``FIREWORKS_IMAGE_MODEL_ID`` or a non-empty ``FIREWORKS_MODEL_ID``).
+    """
+    if not os.environ.get("FIREWORKS_API_KEY"):
+        return None
+    if not (
+        os.environ.get("FIREWORKS_IMAGE_MODEL_ID")
+        or os.environ.get("FIREWORKS_MODEL_ID")
+    ):
+        return None
+    return FireworksImageProvider()
+
+
+def build_image_providers() -> list[_BaseProvider]:
+    """Ordered spatial-stage fallback chain: Meta Image -> Fireworks Image.
+
+    Returns only the providers that are actually configured, so an
+    unconfigured deployment (no Meta key, no Fireworks key) still gets the
+    deterministic rasteriser via the empty list.
+    """
+    providers: list[_BaseProvider] = []
+    meta = build_image_provider()
+    if meta is not None:
+        providers.append(meta)
+    fireworks = build_fireworks_image_provider()
+    if fireworks is not None:
+        providers.append(fireworks)
+    return providers
 
 
 # ---------------------------------------------------------------------------

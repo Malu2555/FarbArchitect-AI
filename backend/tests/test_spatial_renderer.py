@@ -207,6 +207,76 @@ async def test_render_spatial_falls_back_when_provider_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_render_spatial_uses_second_provider_when_first_errors() -> None:
+    """Meta Image fails -> Fireworks Image succeeds -> MUSE_IMAGE provenance."""
+    items = [_item("A", x=10, y=10)]
+    meta = _StubImageProvider(fail=True)
+    fireworks = _StubImageProvider(
+        payload={
+            "footprints": [
+                {
+                    "id": "A",
+                    "origin": [20, 20],
+                    "size": [4, 4],
+                    "label": "Etcher",
+                    "z_index": 1,
+                    "color_token": "teal",
+                }
+            ],
+            "notes": ["fireworks-ratified"],
+        }
+    )
+
+    result = await render_spatial(items, providers=[meta, fireworks])  # type: ignore[arg-type]
+
+    assert meta.calls == 1
+    assert fireworks.calls == 1
+    assert result.spatial_spec.canvas.source == "MUSE_IMAGE"
+    assert result.spatial_spec.footprints[0].origin == (20, 20)
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_uses_second_provider_when_first_reply_unusable() -> None:
+    """Meta Image returns an unusable reply -> Fireworks Image is still tried."""
+    items = [_item("A", x=10, y=10)]
+    meta = _StubImageProvider(
+        payload={
+            "footprints": [
+                {"id": "A", "origin": [10, 10], "size": [40, 40]}  # resized!
+            ]
+        }
+    )
+    fireworks = _StubImageProvider(
+        payload={
+            "footprints": [
+                {"id": "A", "origin": [12, 12], "size": [4, 4], "label": "Etcher"}
+            ],
+            "notes": [],
+        }
+    )
+
+    result = await render_spatial(items, providers=[meta, fireworks])  # type: ignore[arg-type]
+
+    assert meta.calls == 1
+    assert fireworks.calls == 1
+    assert result.spatial_spec.canvas.source == "MUSE_IMAGE"
+    assert result.spatial_spec.footprints[0].origin == (12, 12)
+
+
+@pytest.mark.asyncio
+async def test_render_spatial_falls_back_when_entire_chain_errors() -> None:
+    items = [_item("A", x=10, y=10)]
+    meta = _StubImageProvider(fail=True)
+    fireworks = _StubImageProvider(fail=True)
+
+    result = await render_spatial(items, providers=[meta, fireworks])  # type: ignore[arg-type]
+
+    assert meta.calls == 1
+    assert fireworks.calls == 1
+    assert result.spatial_spec.canvas.source == "FALLBACK"
+
+
+@pytest.mark.asyncio
 async def test_render_spatial_empty_layout() -> None:
     result = await render_spatial([])
 

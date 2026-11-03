@@ -36,7 +36,11 @@ from core.png import (
     png_data_url,
     rasterize_cleanroom,
 )
-from core.providers import MetaImageProvider, ProviderError
+from core.providers import (
+    FireworksImageProvider,
+    MetaImageProvider,
+    ProviderError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,29 +397,56 @@ def _parse_muse_reply(
 async def render_spatial(
     equipment: list[EquipmentItem],
     *,
-    provider: MetaImageProvider | None = None,
+    provider: MetaImageProvider | FireworksImageProvider | None = None,
+    providers: list[MetaImageProvider | FireworksImageProvider] | None = None,
 ) -> SpatialResult:
-    """Run the full spatial stage: sanitize -> (Muse Image) -> spec + PNG."""
+    """Run the full spatial stage: sanitize -> (Muse Image -> Fireworks) -> spec + PNG.
+
+    ``providers`` is the ordered fallback chain (Meta Image first, Fireworks
+    Image second); the first provider that returns a layout that passes the
+    local geometry validator wins. ``provider`` is kept as a single-provider
+    convenience for callers that inject a custom/stub provider (tests).
+
+    If every provider errors out or returns an unusable reply, the deterministic
+    local rasteriser is used as the last stop (existing FALLBACK behaviour).
+    """
     if not equipment:
         return _result_from_spec(_spec_from_layout([], ["empty layout"], "FALLBACK"))
 
     sanitized, notes = sanitize_layout(equipment)
 
-    if provider is not None:
+    chain: list[MetaImageProvider | FireworksImageProvider] = []
+    if providers is not None:
+        chain = list(providers)
+    elif provider is not None:
+        chain = [provider]
+
+    for candidate_provider in chain:
         try:
-            payload = await provider.complete(
+            payload = await candidate_provider.complete(
                 _build_messages(sanitized, notes),
                 schema=SPATIAL_SCHEMA,
-                max_tokens=1500,
+                # 4096 accommodates reasoning models (Muse Spark needs ~640
+                # reasoning tokens before it emits the footprints JSON). The
+                # chat-instruct Muse Image reply finishes far below this cap.
+                max_tokens=4096,
                 temperature=0.0,
             )
         except ProviderError as exc:
-            logger.warning("muse_image_unavailable code=%s", exc.code)
+            logger.warning(
+                "muse_image_unavailable provider=%s code=%s",
+                candidate_provider.name,
+                exc.code,
+            )
+            continue
         else:
             spec = _parse_muse_reply(payload, sanitized)
             if spec is not None:
                 return _result_from_spec(spec)
-            logger.warning("muse_image_reply_unusable falling back")
+            logger.warning(
+                "muse_image_reply_unusable provider=%s falling back",
+                candidate_provider.name,
+            )
 
     spec = _spec_from_layout(sanitized, notes, source="FALLBACK")
     return _result_from_spec(spec)

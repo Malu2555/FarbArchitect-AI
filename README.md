@@ -53,8 +53,8 @@ We pick a model by intent, not by accident:
 | Role | Provider | Model id | When |
 |---|---|---|---|
 | **Primary — text reasoning** | **Meta Model API** (`https://api.llama.com/v1`) | `meta-muse-wonder-2026` | Production deployment on Modal (`META_LLAMA_KEY` set) |
-| **Spatial renderer (optional)** | **Meta Model API** | `meta-muse-image-2026` | Production; only if an image model is configured |
-| **Dev / Fallback** | Fireworks AI (`https://api.fireworks.ai/inference/v1`) | `accounts/fireworks/models/minimax-m3` | Local dev (`META_LLAMA_KEY` empty) and any deployment where the Meta primary fails |
+| **Primary — spatial renderer (optional)** | **Meta Model API** | `meta-muse-image-2026` | Production; only if an image model is configured |
+| **Fallback — text reasoning + spatial** | Fireworks AI (`https://api.fireworks.ai/inference/v1`) | `accounts/fireworks/models/muse-spark-open` | Local dev (`META_LLAMA_KEY` empty) and any deployment where the Meta primary fails |
 
 Configured via env (`PROVIDER_PRIMARY=meta` by default; the router falls
 through automatically on timeout / 4xx / empty content). Every response returns
@@ -62,14 +62,22 @@ the names of the providers that actually ran under `providers_used`, so you can
 tell at a glance whether the answer came from the Meta Model API directly or
 fell through to the Fireworks fallback.
 
+Both stages have a cross-provider Fireworks mirror: `muse-spark-open` (the
+Meta-family reasoning model that *is* available on this Fireworks account)
+serves the strategy stage via `FIREWORKS_MODEL_ID`, and the spatial stage via
+`FIREWORKS_IMAGE_MODEL_ID`. If both Meta and Fireworks are unavailable, the
+spatial renderer falls back to a deterministic local rasteriser, and the
+strategy stage falls back to deterministic physics-only relaxation.
+
 ### Provider stats
 
-| | Meta Model API (`meta-muse-wonder-2026`) | Fireworks fallback (`minimax-m3`) |
+| | Meta Model API (`meta-muse-wonder-2026`) | Fireworks fallback (`muse-spark-open`) |
 |---|---|---|
-| Reasoning tokens / call | reasoning model — ~1k+ | **0** — pure chat-instruct |
-| End-to-end `/simulate` | 40 – 80 s | **4 – 13 s** |
+| Reasoning tokens / call | reasoning model — ~1k+ | reasoning model — **~640** at `reasoning_effort=low` |
+| End-to-end `/simulate` | 40 – 80 s | **5 – 15 s** (≈4 s per corrector turn) |
 | JSON mode (`response_format`) | native | native |
 | Role | production primary on Modal | local dev, CI, last-resort fallback |
+| Headroom needed | higher token budget | `FIREWORKS_MAX_TOKENS>=4096` + `FIREWORKS_REASONING_EFFORT=low` |
 
 ### Why trust-but-verify
 
@@ -102,7 +110,7 @@ seed 42  ─→  generate_scene(42)
             ▼
           ModelRouter.complete()
             │   primary  : Meta Model API  (meta-muse-wonder-2026)
-            │   fallback : Fireworks AI    (minimax-m3, ~1.2 s/turn)
+            │   fallback : Fireworks AI    (muse-spark-open, low reasoning)
             ▼
           Trust-but-verify                    # re-simulate, accept or reject
             │   accept  → phase:"correct"
@@ -394,9 +402,10 @@ gets a veto.**
         +----------------------------------------------------+
                    ^
                    |  fallback / dev path
-+------------------+-------+
++--------------------------+
 |  FIREWORKS AI            |  used when the Meta key is empty
-|  minimax-m3, ~1.2 s/turn |  or the primary call fails
+|  muse-spark-open         |  or the primary call fails
+|  (low reasoning, 4096)   |
 +--------------------------+
 
 Always available: deterministic gradient relaxation (local_relax) -
@@ -514,21 +523,24 @@ and returns:
 }
 ```
 
-## The two-stage Meta Model API pipeline
+## The two-stage pipeline
 
-Both stages call the **Meta Model API** (`https://api.llama.com/v1`); only the
-model id differs. `Muse Wonder` / `Muse Image` below are model-id codenames,
-not separate providers.
+The **primary** stage-1 and stage-2 providers are both on the **Meta Model API**
+(`https://api.llama.com/v1`); only the model id differs. `Muse Wonder` /
+`Muse Image` are model-id codenames, not separate providers. Each stage has a
+**Fireworks mirror** so a Meta outage degrades one provider, not the whole
+pipeline.
 
-| Stage | Model | Env var | Role |
+| Stage | Meta primary (env) | Fireworks mirror (env) | Role |
 |---|---|---|---|
-| 1 | **Muse Wonder** | `META_MODEL_ID` (default `meta-muse-wonder-2026`) | Strategy engine: ingests the scene + sim errors, proposes corrected coordinates, re-simulated for up to 3 turns |
-| 2 | **Muse Image** | `META_IMAGE_MODEL_ID` (default `meta-muse-image-2026`) | Spatial renderer: takes the winning layout matrix, emits canvas-ready `footprints` + a PNG preview |
+| 1 | **Muse Wonder** — `META_MODEL_ID` (default `meta-muse-wonder-2026`) | `FIREWORKS_MODEL_ID` (default `accounts/fireworks/models/muse-spark-open`) | Strategy engine: ingests the scene + sim errors, proposes corrected coordinates, re-simulated for up to 3 turns |
+| 2 | **Muse Image** — `META_IMAGE_MODEL_ID` (default `meta-muse-image-2026`) | `FIREWORKS_IMAGE_MODEL_ID` (default `accounts/fireworks/models/muse-spark-open`) | Spatial renderer: takes the winning layout matrix, emits canvas-ready `footprints` + a PNG preview |
 
-If Muse Image is not configured or unreachable, stage 2 still runs a
-**deterministic local renderer** (clamp → push-out overlaps → pure-Python PNG)
-and reports `source: "FALLBACK"`. The canvas spec is always valid; the UI shows
-which source produced it.
+If both stage-2 providers are unreachable, stage 2 still runs a **deterministic
+local renderer** (clamp → push-out overlaps → pure-Python PNG) and reports
+`source: "FALLBACK"`. The canvas spec is always valid; the UI shows which source
+produced it. Stage 1 falls back to deterministic physics-only relaxation the
+same way.
 
 The local renderer draws machine names using a bundled **5×7 bitmap font**
 (`core/font5x7.py`) — no Pillow, no fonts to install. Placement ladder:
@@ -548,32 +560,39 @@ thumbnail tile beside the live canvas.
 
 ### Fireworks model selection (read this before changing the model id)
 
-**Fireworks does not serve Meta Llama models.** Verified against the live
-`/inference/v1/models` endpoint for this project's key: 29 visible ids, zero
-matching `llama`. The Meta-curated names used in the product narrative
-(Muse Wonder, Muse Spark) are **not** interchangeable with a Fireworks slug —
-they are different families. `muse-spark-open` *is* present on some accounts,
-but it is a **reasoning** model: 500+ thinking tokens per call, 16 s latency,
-and it truncates at a 1024-token budget.
+**Verified live against `/inference/v1/models` for this project's key (Nov 2026):**
+30 visible ids, **zero** matching `llama` — the account does *not* serve open
+Llama weights. It *does* serve `muse-spark-open`, the Meta-family reasoning
+model, which is what the fallback uses. Four ids that look plausible but return
+`404 Model not found, inaccessible, and/or not deployed` on both the local dev
+key and the production `llm-keys` Modal secret: `muse-glimmer-30b`,
+`llama-v3p1-70b-instruct-1b`, `llama4-maverick-instruct-basic`,
+`llama4-scout-instruct-basic`. Always confirm before pinning.
 
 Two scripts exist so this is never guesswork:
 
 ```bash
 python scripts/list_fireworks_models.py            # what can this key reach?
-python scripts/probe_model_candidates.py           # latency + reasoning + JSON
+python scripts/probe_raw.py --model <model-id>     # live correctness probe
 ```
 
-The default is `accounts/fireworks/models/minimax-m3` — `reasoning_tokens=0`,
-~1.2 s per call, and it emits schema-valid `{"adjustments": [...]}`. For
-reference, the measured alternatives:
+The default is `accounts/fireworks/models/muse-spark-open`, run with
+`FIREWORKS_REASONING_EFFORT=low` and `FIREWORKS_MAX_TOKENS=4096`. At that
+setting it emits schema-valid `{"adjustments": [...]}` **and**
+`{"footprints": [...]}`, so one model covers both stages. Measured behaviour of
+the reachable candidates:
 
 | Model | Latency | Reasoning tokens | Valid JSON |
 |---|---|---|---|
-| `minimax-m3` | **1.2 s** | **0** | yes |
+| **`muse-spark-open`** @ `reasoning_effort=low`, 4096 cap | ~4 s | **640** | **yes** — both schemas |
+| `minimax-m3` *(retired default)* | 1.2 s | 0 | yes — but being de-listed |
+| `minimax-m3p1-flash` @ 1024 **and** @ 4096 cap | — | 1024 / 4096 | **no** — `finish_reason=length`, content empty |
 | `nemotron-3-ultra-nvfp4` | 1.7 s | 0 | ignored JSON mode, 2.8 kB of prose |
 | `inkling` | 74 s | 0 | yes, but far too slow |
-| `muse-spark-open` | 16 s | 509 | no — truncates at `length` |
-| `gpt-oss-120b`, `kimi-k3`, `glm-5p3`, `qwen3p8-max`, `deepseek-v4p1-*`, `ember-1` | 1–4 s | 72–512 | yes, but **all reasoning models** |
+
+> If you point `FIREWORKS_MODEL_ID` at a chat-instruct model, set
+> `FIREWORKS_MAX_TOKENS=1024` **and** `FIREWORKS_REASONING_EFFORT=` (explicitly
+> empty) — chat-instruct models reject the `reasoning_effort` field outright.
 
 ### Trust-but-verify: the model proposes, the solver decides
 
@@ -676,19 +695,24 @@ modal secret create llm-keys \
     META_MODEL_ID=meta-muse-wonder-2026 \
     META_IMAGE_MODEL_ID=meta-muse-image-2026 \
     FIREWORKS_API_KEY=... \
-    FIREWORKS_MODEL_ID=accounts/fireworks/models/minimax-m3 \
+    FIREWORKS_MODEL_ID=accounts/fireworks/models/muse-spark-open \
     FIREWORKS_READ_TIMEOUT_S=45 \
-    FIREWORKS_MAX_TOKENS=1024 \
+    FIREWORKS_MAX_TOKENS=4096 \
+    FIREWORKS_REASONING_EFFORT=low \
+    FIREWORKS_IMAGE_MODEL_ID=accounts/fireworks/models/muse-spark-open \
     CORS_ALLOWED_ORIGINS=https://<your-app>.vercel.app
 
 modal deploy backend/modal_app.py
 ```
 
-> Only `FIREWORKS_API_KEY` is strictly required for the strategy agent; the
-> model id defaults to `minimax-m3`. Do **not** set `FIREWORKS_REASONING_EFFORT`
-> unless the model id points at a reasoning model — chat-instruct models reject
-> the field. Re-run `scripts/list_fireworks_models.py` before shipping, since
-> Fireworks rotates its catalogue.
+> **Do not omit `FIREWORKS_MAX_TOKENS` and `FIREWORKS_REASONING_EFFORT`.** The
+> default model (`muse-spark-open`) is a *reasoning* model: at the old 1024-token
+> cap it spends the entire budget thinking and returns empty content
+> (`finish_reason=length`). 4096 + `reasoning_effort=low` leaves ~640 tokens of
+> thinking plus room for the JSON reply. Re-run `scripts/list_fireworks_models.py`
+> before shipping, since Fireworks rotates its catalogue. If you swap to a
+> chat-instruct model, set `FIREWORKS_MAX_TOKENS=1024` and
+> `FIREWORKS_REASONING_EFFORT=` (explicitly empty).
 
 #### What Modal actually does (and does not do)
 

@@ -16,10 +16,13 @@ import pytest
 
 from core.providers import (
     AllProvidersFailed,
+    FireworksImageProvider,
     MetaImageProvider,
     ProviderError,
     _BaseProvider,
+    build_fireworks_image_provider,
     build_image_provider,
+    build_image_providers,
     ModelRouter,
 )
 
@@ -277,6 +280,102 @@ def test_build_image_provider_returns_instance_when_configured(
 
 
 # ---------------------------------------------------------------------------
+# FireworksImageProvider - spatial-stage Fireworks fallback
+# ---------------------------------------------------------------------------
+def test_build_fireworks_image_provider_returns_none_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    monkeypatch.setenv("FIREWORKS_IMAGE_MODEL_ID", "accounts/fireworks/models/muse-spark-open")
+    assert build_fireworks_image_provider() is None
+
+
+def test_build_fireworks_image_provider_returns_instance_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test")
+    monkeypatch.setenv(
+        "FIREWORKS_IMAGE_MODEL_ID", "accounts/fireworks/models/muse-spark-open"
+    )
+
+    provider = build_fireworks_image_provider()
+    assert isinstance(provider, FireworksImageProvider)
+    assert provider.model_id == "accounts/fireworks/models/muse-spark-open"
+    assert provider.name == "fireworks_image"
+    assert provider.reasoning_effort == "low"
+    assert provider.max_tokens == 4096
+
+
+def test_build_fireworks_image_provider_honours_image_env_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image-specific env vars take precedence over the strategy ones."""
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test")
+    monkeypatch.setenv("FIREWORKS_MODEL_ID", "accounts/fireworks/models/x")
+    monkeypatch.setenv(
+        "FIREWORKS_IMAGE_MODEL_ID", "accounts/fireworks/models/y"
+    )
+    monkeypatch.setenv("FIREWORKS_IMAGE_MAX_TOKENS", "2048")
+    monkeypatch.setenv("FIREWORKS_IMAGE_REASONING_EFFORT", "high")
+
+    provider = build_fireworks_image_provider()
+    assert isinstance(provider, FireworksImageProvider)
+    assert provider.model_id == "accounts/fireworks/models/y"
+    assert provider.max_tokens == 2048
+    assert provider.reasoning_effort == "high"
+
+
+# ---------------------------------------------------------------------------
+# build_image_providers - ordered fallback chain
+# ---------------------------------------------------------------------------
+def test_build_image_providers_returns_both_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("META_LLAMA_KEY", "test-key")
+    monkeypatch.setenv("META_IMAGE_MODEL_ID", "meta-muse-image-2026")
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test")
+    monkeypatch.setenv(
+        "FIREWORKS_IMAGE_MODEL_ID", "accounts/fireworks/models/muse-spark-open"
+    )
+
+    chain = build_image_providers()
+    assert [p.name for p in chain] == ["meta_image", "fireworks_image"]
+
+
+def test_build_image_providers_meta_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("META_LLAMA_KEY", "test-key")
+    monkeypatch.setenv("META_IMAGE_MODEL_ID", "meta-muse-image-2026")
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+
+    chain = build_image_providers()
+    assert [p.name for p in chain] == ["meta_image"]
+
+
+def test_build_image_providers_fireworks_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("META_LLAMA_KEY", raising=False)
+    monkeypatch.delenv("META_IMAGE_MODEL_ID", raising=False)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test")
+    monkeypatch.setenv(
+        "FIREWORKS_IMAGE_MODEL_ID", "accounts/fireworks/models/muse-spark-open"
+    )
+
+    chain = build_image_providers()
+    assert [p.name for p in chain] == ["fireworks_image"]
+
+
+def test_build_image_providers_empty_when_nothing_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("META_LLAMA_KEY", raising=False)
+    monkeypatch.delenv("META_IMAGE_MODEL_ID", raising=False)
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    monkeypatch.delenv("FIREWORKS_IMAGE_MODEL_ID", raising=False)
+    monkeypatch.delenv("FIREWORKS_MODEL_ID", raising=False)
+
+    assert build_image_providers() == []
+
+
+# ---------------------------------------------------------------------------
 # FireworksProvider — env-driven timeout + output-token cap
 # ---------------------------------------------------------------------------
 def test_fireworks_provider_reads_timeout_and_cap_from_env(
@@ -303,13 +402,17 @@ def test_fireworks_provider_defaults_when_env_absent(
     monkeypatch.delenv("FIREWORKS_READ_TIMEOUT_S", raising=False)
     monkeypatch.delenv("FIREWORKS_MAX_TOKENS", raising=False)
     monkeypatch.delenv("FIREWORKS_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("FIREWORKS_MODEL_ID", raising=False)
 
     provider = FireworksProvider()
 
     assert provider.timeout.read == 45.0
-    # Chat-instruct default: no reasoning headroom required.
-    assert provider.max_tokens == 1024
-    assert provider.reasoning_effort == ""
+    # Default model is muse-spark-open (a reasoning model), so 4096 tokens of
+    # headroom + reasoning_effort=low are required to get past the thinking
+    # phase and into the JSON reply.
+    assert provider.model_id == "accounts/fireworks/models/muse-spark-open"
+    assert provider.max_tokens == 4096
+    assert provider.reasoning_effort == "low"
 
 
 @pytest.mark.asyncio
@@ -349,13 +452,19 @@ async def test_fireworks_provider_sends_reasoning_effort_when_set(
 
 
 @pytest.mark.asyncio
-async def test_fireworks_provider_omits_reasoning_effort_when_unset(
+async def test_fireworks_provider_omits_reasoning_effort_when_explicitly_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Explicit empty ``FIREWORKS_REASONING_EFFORT=`` disables the field.
+
+    The default is ``low`` (for the reasoning default model); setting the env
+    var to an empty string is the documented escape hatch for chat-instruct
+    models, which reject the field outright.
+    """
     from core.providers import FireworksProvider
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test")
-    monkeypatch.delenv("FIREWORKS_REASONING_EFFORT", raising=False)
+    monkeypatch.setenv("FIREWORKS_REASONING_EFFORT", "")
 
     captured: dict = {}
 

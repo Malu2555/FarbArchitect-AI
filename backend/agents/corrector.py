@@ -39,7 +39,7 @@ from core.providers import (
     AllProvidersFailed,
     MetaImageProvider,
     ModelRouter,
-    build_image_provider,
+    build_image_providers,
 )
 from core.simulation import simulate_scene
 
@@ -495,10 +495,8 @@ async def run_correction(
     spatial_source = "FALLBACK"
     if use_spatial_stage:
         try:
-            provider = image_provider
-            if provider is None:
-                provider = build_image_provider()
-            spatial_result = await render_spatial(best_equipment, provider=provider)
+            providers = [image_provider] if image_provider is not None else build_image_providers()
+            spatial_result = await render_spatial(best_equipment, providers=providers)
             spatial_source = spatial_result.spatial_spec.canvas.source
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("spatial_stage_failed: %s", exc)
