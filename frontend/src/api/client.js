@@ -158,3 +158,67 @@ export async function synopsis({ equipment = [], signal = null } = {}) {
 export async function equipmentCatalog() {
   return request('/api/v1/equipment/catalog', { method: 'GET', timeoutMs: 8000 });
 }
+
+// ---------------------------------------------------------------------------
+// Equipment upload (XLSX / CSV) — multipart, so a separate fetch path from the
+// JSON `request()` helper above.
+// ---------------------------------------------------------------------------
+const UPLOAD_TIMEOUT_MS = Number(
+  import.meta.env.VITE_UPLOAD_TIMEOUT_MS || 60000
+);
+
+async function uploadFile(path, file, { timeoutMs = UPLOAD_TIMEOUT_MS, signal } = {}) {
+  const url = `${API_BASE}${path}`;
+  const form = new FormData();
+  form.append('file', file, file.name || 'upload.xlsx');
+
+  const { signal: effectiveSignal, dispose } = withTimeout(signal, timeoutMs);
+  try {
+    // NB: do NOT set content-type — the browser adds the multipart boundary.
+    const res = await fetch(url, { method: 'POST', body: form, signal: effectiveSignal });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      const safe = redact(text).slice(0, 240);
+      let code = '';
+      let retryAfterSeconds = null;
+      try {
+        const parsed = JSON.parse(safe);
+        code = parsed?.code ?? '';
+        retryAfterSeconds = parsed?.retry_after_seconds ?? null;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new ApiError(
+        `HTTP ${res.status}${safe ? `: ${safe}` : ''}`,
+        { status: res.status, code, retryAfterSeconds }
+      );
+    }
+    return await res.json();
+  } finally {
+    dispose();
+  }
+}
+
+/** Parse an uploaded equipment list into drafts (no coordinates yet). */
+export async function parseEquipmentUpload(file, opts = {}) {
+  return uploadFile('/api/v1/equipment/parse', file, opts);
+}
+
+/** Auto-place already-parsed drafts onto the grid (no file, JSON body). */
+export async function placeEquipment(upload, { strategy = 'grid', room = null } = {}) {
+  return request('/api/v1/equipment/place', {
+    body: { upload, strategy, room },
+    timeoutMs: UPLOAD_TIMEOUT_MS,
+  });
+}
+
+/**
+ * One-shot demo endpoint: parse + auto-place + run the full simulation on the
+ * judge's own equipment list.
+ */
+export async function simulateUpload(file, { strategy = 'grid', signal } = {}) {
+  return uploadFile(`/api/v1/simulate/upload?strategy=${encodeURIComponent(strategy)}`, file, {
+    signal,
+    timeoutMs: Number(import.meta.env.VITE_SIMULATE_TIMEOUT_MS || 180000),
+  });
+}

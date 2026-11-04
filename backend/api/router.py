@@ -13,12 +13,18 @@ import os
 import platform
 from functools import lru_cache
 
-from ninja import Router
+from ninja import File, Router
+from ninja.files import UploadedFile
 
 from agents.corrector import classify_errors, run_correction
 from agents.schemas import (
     CatalogItem,
     CorrectionTurn,
+    EquipmentItem,
+    EquipmentUpload,
+    ParseSummary,
+    PlaceRequest,
+    PlacementResult,
     Scene,
     SimulateRequest,
     SimulateResponse,
@@ -26,6 +32,8 @@ from agents.schemas import (
     TEMP_LIMIT_C,
 )
 from agents.spatial_renderer import build_fallback_result
+from core.equipment_parser import MAX_FILE_BYTES, UnsupportedFormat, parse_upload
+from core.placement import auto_place
 from core.simulation import simulate_scene
 from core.synthetic_gen import catalog_payload, generate_scene
 
@@ -35,6 +43,7 @@ from api.throttling import (
     HEALTH_THROTTLE,
     PREVIEW_THROTTLE,
     SIMULATE_THROTTLE,
+    UPLOAD_THROTTLE,
 )
 
 router = Router(tags=["sim"])
@@ -126,21 +135,14 @@ def _resolve_scene(payload: SimulateRequest) -> tuple[int, Scene]:
 # ---------------------------------------------------------------------------
 # Simulate
 # ---------------------------------------------------------------------------
-@router.post(
-    "/simulate",
-    response=SimulateResponse,
-    summary="Run the full simulation",
-    throttle=SIMULATE_THROTTLE,
-)
-async def simulate_endpoint(request, payload: SimulateRequest) -> SimulateResponse:
-    """Run physics -> agentic self-correction -> structured response.
+async def _run_simulation(scene: Scene) -> SimulateResponse:
+    """Core simulate pipeline shared by ``/simulate`` and ``/simulate/upload``.
 
     Fast path: if the initial layout is already clean (peak <= 26 C and zero
     hazards), we skip the LLM entirely (``providers_used == []``) and return
     immediately. That keeps runtimes low and preserves quota for tricky scenes.
     """
-    seed, scene = _resolve_scene(payload)
-
+    seed = scene.seed
     before = simulate_scene(scene)
 
     if before.peak_c <= TEMP_LIMIT_C and not before.hazards:
@@ -183,6 +185,18 @@ async def simulate_endpoint(request, payload: SimulateRequest) -> SimulateRespon
         spatial=outcome.spatial_result,
         spatial_source=outcome.spatial_source,
     )
+
+
+@router.post(
+    "/simulate",
+    response=SimulateResponse,
+    summary="Run the full simulation",
+    throttle=SIMULATE_THROTTLE,
+)
+async def simulate_endpoint(request, payload: SimulateRequest) -> SimulateResponse:
+    """Run physics -> agentic self-correction -> structured response."""
+    _, scene = _resolve_scene(payload)
+    return await _run_simulation(scene)
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +244,110 @@ def equipment_catalog_endpoint(request) -> list[CatalogItem]:
     one the generator placed, because both read the same numbers.
     """
     return [CatalogItem(**row) for row in catalog_payload()]
+
+
+# ---------------------------------------------------------------------------
+# User equipment upload (XLSX / CSV -> drafts -> placed layout -> simulation)
+# ---------------------------------------------------------------------------
+def _scene_from_equipment(equipment: list[EquipmentItem], grid_size: int) -> Scene:
+    """Wrap placed equipment in a Scene with a deterministic (content-hashed) seed.
+
+    The seed is stable for a given layout so repeat runs of the same upload are
+    reproducible in screenshots and logs.
+    """
+    total = sum(int(item.heat_watts) + int(item.vibration_db) for item in equipment)
+    return Scene(seed=total % 100000, grid_size=grid_size, equipment=equipment)
+
+
+@router.post(
+    "/equipment/parse",
+    response=EquipmentUpload,
+    summary="Parse an uploaded XLSX/CSV equipment list (no coordinates yet)",
+    throttle=UPLOAD_THROTTLE,
+)
+async def equipment_parse_endpoint(
+    request, file: UploadedFile = File(...)  # noqa: B008 - Ninja DI
+) -> EquipmentUpload:
+    """Turn an uploaded spec sheet into ``EquipmentDraft`` objects.
+
+    Returns HTTP 413 for oversized files, 415 for unsupported types, and 422
+    when the file is not a recognisable equipment list (no header row).
+    """
+    from ninja.errors import HttpError
+
+    raw = file.read()
+    if len(raw) > MAX_FILE_BYTES:
+        raise HttpError(
+            413,
+            f"file too large ({len(raw)} bytes); the limit is {MAX_FILE_BYTES} bytes",
+        )
+    try:
+        upload = parse_upload(raw, file.name or "upload.xlsx")
+    except UnsupportedFormat as exc:
+        raise HttpError(415, str(exc)) from exc
+    except ValueError as exc:
+        raise HttpError(422, str(exc)) from exc
+
+    if not upload.drafts:
+        raise HttpError(
+            422,
+            "no machines found — expected a table with name, watts and dB columns",
+        )
+    return upload
+
+
+@router.post(
+    "/equipment/place",
+    response=PlacementResult,
+    summary="Auto-place parsed equipment onto the simulation grid",
+    throttle=UPLOAD_THROTTLE,
+)
+def equipment_place_endpoint(request, payload: PlaceRequest) -> PlacementResult:
+    """Assign grid coordinates to every parsed draft (grid / load_based / random)."""
+    return auto_place(payload.upload, strategy=payload.strategy, room=payload.room)
+
+
+@router.post(
+    "/simulate/upload",
+    response=SimulateResponse,
+    summary="Parse + place + simulate an uploaded equipment list in one call",
+    throttle=SIMULATE_THROTTLE,
+)
+async def simulate_upload_endpoint(
+    request,
+    file: UploadedFile = File(...),  # noqa: B008 - Ninja DI
+    strategy: str = "grid",
+) -> SimulateResponse:
+    """One-shot pipeline: parse the upload, auto-place it, then run the full
+    corrector/Muse chain exactly like ``POST /simulate``.
+
+    This is the headline demo endpoint: a judge drops their own fab's equipment
+    list and gets a rebalanced floorplan back without hand-placing anything.
+    """
+    from ninja.errors import HttpError
+
+    if strategy not in ("grid", "load_based", "random"):
+        raise HttpError(422, f"unknown strategy {strategy!r}")
+
+    raw = file.read()
+    if len(raw) > MAX_FILE_BYTES:
+        raise HttpError(413, f"file too large; limit is {MAX_FILE_BYTES} bytes")
+    try:
+        upload = parse_upload(raw, file.name or "upload.xlsx")
+    except UnsupportedFormat as exc:
+        raise HttpError(415, str(exc)) from exc
+    except ValueError as exc:
+        raise HttpError(422, str(exc)) from exc
+
+    if not upload.drafts:
+        raise HttpError(
+            422,
+            "no machines found — expected a table with name, watts and dB columns",
+        )
+
+    placed = auto_place(upload, strategy=strategy)
+    if not placed.equipment:
+        raise HttpError(422, "the uploaded machines do not fit on the grid")
+
+    scene = _scene_from_equipment(placed.equipment, placed.grid_size)
+    return await _run_simulation(scene)

@@ -75,6 +75,19 @@ export function useSimulation() {
     finishedAt.value = null;
   }
 
+  /**
+   * Adopt an externally-produced SimulateResponse (e.g. from `/simulate/upload`,
+   * which runs the identical chain but takes a file instead of JSON). Keeps the
+   * dashboard's single source of truth intact without duplicating state.
+   */
+  function adopt(data) {
+    if (!data) return;
+    result.value = data;
+    error.value = null;
+    startedAt.value = performance.now();
+    finishedAt.value = performance.now();
+  }
+
   return {
     result,
     loading,
@@ -99,5 +112,6 @@ export function useSimulation() {
     noClipping,
     run,
     reset,
+    adopt,
   };
 }

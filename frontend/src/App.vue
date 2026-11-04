@@ -9,7 +9,8 @@ import TriggerButton from './components/TriggerButton.vue';
 import CatalogSidebar from './components/CatalogSidebar.vue';
 import ComputeSuggestionsButton from './components/ComputeSuggestionsButton.vue';
 import ConstraintBadge from './components/ConstraintBadge.vue';
-import { health } from './api/client';
+import UploadEquipmentBanner from './components/UploadEquipmentBanner.vue';
+import { placeEquipment, health } from './api/client';
 import { useSimulation } from './composables/useSimulation';
 import { useScenarioStore } from './composables/useScenarioStore';
 
@@ -33,6 +34,7 @@ const {
   noClipping,
   canvasProvenance,
   run: runSimulation,
+  adopt: adoptSimulationResult,
 } = useSimulation();
 
 const {
@@ -52,6 +54,8 @@ const {
 
 const seedInput = ref('');
 const backendStatus = ref('checking');
+const uploadOpen = ref(false);
+const uploadNotice = ref('');
 
 // Scenario editor is opt-in: the seed demo keeps its original canvas priority
 // until the user asks to edit or drops a machine from the catalog.
@@ -151,6 +155,39 @@ async function computeOnScenario() {
     /* surfaced through error ref */
   }
 }
+
+// ---------------------------------------------------------------------------
+// Equipment upload handlers
+// ---------------------------------------------------------------------------
+async function onUploadApply({ upload, strategy }) {
+  // Turn parsed drafts into positioned equipment, then open the editor.
+  try {
+    uploadNotice.value = '';
+    const placed = await placeEquipment(upload, { strategy });
+    if (placed?.equipment?.length) {
+      hydrate(placed.equipment);
+      editRequested.value = true;
+      dropNotice.value = '';
+      uploadNotice.value = `Loaded ${placed.equipment.length} machine(s) from ${upload.source_filename}.`;
+      uploadOpen.value = false;
+    }
+  } catch (err) {
+    uploadNotice.value = err?.message || String(err);
+  }
+}
+
+function onUploadOptimize(result) {
+  // `/simulate/upload` already ran the whole chain; adopt its full response so
+  // the canvas, metrics, event log and spatial thumbnail all update together.
+  if (!result) return;
+  adoptSimulationResult(result);
+  if (result.final_layout?.length) {
+    hydrate(result.final_layout);
+    editRequested.value = true;
+    uploadNotice.value = 'Optimized your uploaded layout — see the canvas and metrics.';
+    uploadOpen.value = false;
+  }
+}
 </script>
 
 <template>
@@ -232,6 +269,19 @@ async function computeOnScenario() {
           />
           <button
             type="button"
+            :aria-expanded="uploadOpen"
+            :class="[
+              'rounded-lg border px-3 py-2 text-sm font-semibold transition',
+              uploadOpen
+                ? 'border-teal-500/60 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25'
+                : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-teal-600 hover:text-teal-200',
+            ]"
+            @click="uploadOpen = !uploadOpen"
+          >
+            📥 Upload equipment
+          </button>
+          <button
+            type="button"
             :class="[
               'rounded-lg border px-3 py-2 text-sm font-semibold transition',
               scenarioActive
@@ -245,6 +295,20 @@ async function computeOnScenario() {
         </div>
       </div>
     </header>
+
+    <UploadEquipmentBanner
+      v-if="uploadOpen"
+      @apply="onUploadApply"
+      @optimize="onUploadOptimize"
+      @close="uploadOpen = false"
+    />
+
+    <p
+      v-if="uploadNotice"
+      class="mx-auto w-full max-w-7xl px-6 pb-1 text-[11px] text-teal-300"
+    >
+      {{ uploadNotice }}
+    </p>
 
     <main
       class="mx-auto grid w-full max-w-7xl flex-1 gap-4 p-6 lg:grid-cols-[18rem_minmax(0,1fr)_22rem]"

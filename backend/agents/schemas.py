@@ -13,9 +13,15 @@ __all__ = [
     "CanvasProvenance",
     "CatalogItem",
     "CorrectionTurn",
+    "EquipmentDraft",
     "EquipmentItem",
+    "EquipmentUpload",
     "FootprintBox",
     "Hazard",
+    "ParseSummary",
+    "PlacementResult",
+    "PlaceRequest",
+    "RoomDraft",
     "Scene",
     "SimulateRequest",
     "SimulateResponse",
@@ -144,6 +150,78 @@ class SimulateResponse(BaseModel):
     # Stage 2 of the dual-Muse pipeline: Muse Image output.
     spatial: SpatialResult | None = None
     spatial_source: Literal["MUSE_IMAGE", "FALLBACK"] = "FALLBACK"
+
+
+# ---------------------------------------------------------------------------
+# User equipment upload (XLSX / CSV -> EquipmentDraft -> placed EquipmentItem)
+# ---------------------------------------------------------------------------
+class RoomDraft(BaseModel):
+    """Floorplan dimensions parsed from the upload — metres, not grid cells.
+
+    Optional: many spreadsheets do not include the room block. When absent the
+    placement stage falls back to the canonical 100×100 grid.
+    """
+
+    name: str = ""
+    width_m: float | None = Field(default=None, gt=0, le=1000)
+    depth_m: float | None = Field(default=None, gt=0, le=1000)
+
+
+class EquipmentDraft(BaseModel):
+    """One machine parsed from a spec sheet — **without** grid coordinates.
+
+    The upload file never tells us where a machine sits, only what it is. The
+    placement stage (``core/placement.py``) is what turns a draft into a
+    positioned ``EquipmentItem``.
+    """
+
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    machine_type: str = Field(default="", max_length=64)
+    w: int = Field(ge=1, le=40, description="footprint width in grid cells")
+    h: int = Field(ge=1, le=40, description="footprint height in grid cells")
+    heat_watts: float = Field(gt=0, le=5000)
+    vibration_db: float = Field(ge=30, le=120)
+    source_row: int = Field(default=0, ge=0, description="1-based row in the upload")
+
+
+class ParseSummary(BaseModel):
+    """Human-readable account of what the parser did, surfaced in the UI table."""
+
+    rows_total: int = 0
+    rows_parsed: int = 0
+    rows_skipped: int = 0
+    types_recognized: list[str] = []
+    types_unrecognized: list[str] = []
+    warnings: list[str] = []
+
+
+class EquipmentUpload(BaseModel):
+    """Parser output: drafts ready for placement, plus provenance."""
+
+    source_filename: str = ""
+    source_kind: Literal["xlsx", "csv"] = "xlsx"
+    room: RoomDraft = Field(default_factory=RoomDraft)
+    drafts: list[EquipmentDraft] = []
+    summary: ParseSummary = Field(default_factory=ParseSummary)
+
+
+class PlaceRequest(BaseModel):
+    """Auto-place a parsed upload onto the simulation grid."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    upload: EquipmentUpload
+    strategy: Literal["grid", "load_based", "random"] = "grid"
+    room: RoomDraft | None = None
+
+
+class PlacementResult(BaseModel):
+    """Placed equipment ready to feed straight into ``POST /simulate``."""
+
+    equipment: list[EquipmentItem]
+    grid_size: int
+    strategy: Literal["grid", "load_based", "random"] = "grid"
 
 
 # ---------------------------------------------------------------------------

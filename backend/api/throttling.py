@@ -47,6 +47,7 @@ __all__ = [
     "PREVIEW_THROTTLE",
     "SIMULATE_THROTTLE",
     "ScopedAnonThrottle",
+    "UPLOAD_THROTTLE",
     "default_rate",
     "normalize_rate",
     "throttled_handler",
@@ -152,6 +153,13 @@ PREVIEW_THROTTLE: Final[ScopedAnonThrottle] = ScopedAnonThrottle(
 #: Static equipment catalog. Cheap and cacheable, so the cap is generous.
 CATALOG_THROTTLE: Final[ScopedAnonThrottle] = ScopedAnonThrottle(
     "catalog", default_rate("RATE_CATALOG", "120/min")
+)
+
+#: Equipment-list upload + parse. File parsing (openpyxl) is CPU-bound and the
+#: endpoint is a plausible abuse vector, so keep it tight. The optimize-on-upload
+#: endpoint reuses ``SIMULATE_THROTTLE`` since it runs the same LLM loop.
+UPLOAD_THROTTLE: Final[ScopedAnonThrottle] = ScopedAnonThrottle(
+    "upload", default_rate("RATE_UPLOAD", "10/min")
 )
 
 

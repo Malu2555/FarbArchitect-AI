@@ -470,6 +470,11 @@ Copy `backend/.env.example` → `backend/.env` for local testing. In production
 | `GET` | `/api/v1/health` | Liveness + build metadata | `120/min` |
 | `GET` | `/api/v1/health/deep` | Dependency versions + provider key presence | `30/min` |
 | `POST` | `/api/v1/simulate` | Full physics + agentic self-correction pipeline | `12/min` |
+| `POST` | `/api/v1/simulate/synopsis` | Physics-only verdict (no LLM) for the live editor | `60/min` |
+| `GET` | `/api/v1/equipment/catalog` | Draggable machine types (scenario editor) | `120/min` |
+| `POST` | `/api/v1/equipment/parse` | Parse an uploaded XLSX/CSV into equipment drafts | `10/min` |
+| `POST` | `/api/v1/equipment/place` | Auto-place parsed drafts onto the grid | `10/min` |
+| `POST` | `/api/v1/simulate/upload` | Parse + place + full simulation from one uploaded file | `12/min` |
 
 Rate limits are configurable via `RATE_SIMULATE`, `RATE_HEALTH`,
 `RATE_HEALTH_DEEP`, `RATE_ANON` and `TRUSTED_PROXY_HOPS` (see
@@ -683,6 +688,84 @@ generate_scene(seed) ─┐
                       ├─→ Scene ─→ run_correction() ─→ final_equipment
 catalog + drag/drop ──┘
 ```
+
+## Bring your own equipment list (XLSX / CSV)
+
+A judge (or any operator) usually arrives with their own machine list, not a
+seed. The **📥 Upload equipment** button in the header opens a full-width banner:
+drop an `.xlsx` or `.csv`, review the parsed table, pick a placement strategy,
+and either **Apply to editor** (position the machines, then let the agent run)
+or **⚡ Optimize now** (one shot: parse → place → full agentic correction).
+
+### File format
+
+The parser is column-tolerant. At minimum it needs a **name** (or id), a
+**watts** column and a **dB** column. Footprint and room dimensions are optional.
+
+```
+Cleanroom: Bay 7, 40, 25            ← optional room block (metres): width, depth
+
+name,type,power (W),noise (dB),width (m),height (m)
+ASML Stepper 1980,stepper,380,92,4,3
+LAM Etcher,etch,220,78,2.5,2.5
+CMP Polisher 3,cmp,1800,96,3,2
+```
+
+- **Footprint is in metres** and converted to grid cells at `0.5 m/cell`
+  (a 4 m × 3 m stepper → 8 × 6 cells). A header literally saying “cell” skips
+  the conversion.
+- **Machine types are resolved** by a hand-curated alias table (`stepper` →
+  `LITHO_SCANNER`, `furnace` → `DIFFUSION_FURNACE`, …), then a fuzzy fallback.
+  An unrecognised type is **surfaced in the table** (amber) and kept — never
+  silently misclassified.
+- Rows missing watts or dB are skipped with a line-numbered warning; the parser
+  stops at the first fully-blank row.
+
+### Pipeline
+
+```
+Uploaded .xlsx/.csv
+      │  core/equipment_parser.parse_upload()   → EquipmentDraft[] (no coords)
+      ▼
+POST /equipment/parse  →  POST /equipment/place  →  POST /simulate
+      │                     core/placement.auto_place()          (unchanged chain)
+      ▼
+EquipmentItem[] (grid coords)  ─→  run_correction()  ─→  final_layout + spatial
+```
+
+Nothing about the corrector, providers, or spatial renderer changes — an
+uploaded machine is just another `EquipmentItem` by the time it reaches them.
+
+### Placement strategies (`core/placement.py`)
+
+| Strategy | What it does |
+|---|---|
+| `grid` | Shelf-packs machines row-major from the top-left. Predictable default. |
+| `load_based` | Hottest machines first, so they land at the edges; coolest settle later. |
+| `random` | Seeded by a hash of the upload, so the same file always lands the same way. |
+
+Placement is only the **starting** layout — the corrector is free to move
+everything afterwards. When a fab genuinely has more footprint than fits,
+extra drafts are dropped (the endpoint returns `422` if none fit).
+
+### Endpoints
+
+| Endpoint | Body | Returns |
+|---|---|---|
+| `POST /api/v1/equipment/parse` | multipart `file` | `EquipmentUpload` (drafts + room + summary) |
+| `POST /api/v1/equipment/place` | `{ upload, strategy, room? }` | `PlacementResult` (positioned `EquipmentItem[]`) |
+| `POST /api/v1/simulate/upload` | multipart `file` + `?strategy=` | full `SimulateResponse` (identical shape to `/simulate`) |
+
+Uploads are capped at **5 MB** (`413` beyond that), non-xlsx/csv types return
+`415`, and unparseable files return `422`.
+
+### Deliberately out of scope (hackathon tier)
+
+- **DOCX / PDF** parsing (incl. scanned PDFs). XLSX + CSV cover the stated
+  real-world case (operators keep these in spreadsheets).
+- **Persistent history** of uploads. Runs stay stateless; re-uploading is cheap.
+
+
 
 | Mode | How you enter it | What runs |
 |---|---|---|
