@@ -11,6 +11,8 @@ ships **without a database**. The Meta Model API drives the corrector in
 production; Fireworks AI is the dev / fallback story. They cooperate through a
 verifier-gated loop.
 
+📺 **Watch it in action:** [YouTube — @ibtcmalu6101](https://www.youtube.com/@ibtcmalu6101)
+
 ---
 
 ## The problem
