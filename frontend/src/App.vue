@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
+import { inject } from '@vercel/analytics';
 import FloorplanCanvas from './components/FloorplanCanvas.vue';
 import EventLog from './components/EventLog.vue';
 import MetricsPanel from './components/MetricsPanel.vue';
@@ -67,6 +68,9 @@ const scenarioActive = computed(
 );
 
 onMounted(async () => {
+  // Initialize Vercel Web Analytics
+  inject();
+  
   try {
     await health();
     backendStatus.value = 'online';
